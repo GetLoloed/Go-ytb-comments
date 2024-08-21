@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"net/http"
@@ -11,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cenkalti/backoff"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/fatih/color"
 	"github.com/spf13/viper"
 	"golang.org/x/time/rate"
@@ -22,10 +23,10 @@ import (
 const (
 	youtubeApiServiceName   = "youtube"
 	youtubeApiVersion       = "v3"
-	defaultCommentsFileName = "comments.txt"
+	defaultCommentsFileName = "comments"
 	invalidInputMsg         = "Invalid input. Please enter a positive integer."
 	invalidURLMsg           = "Invalid YouTube URL"
-	errorAPICallMsg         = "Error making search API call: %v"
+	errorAPICallMsg         = "Error during API search call: %v"
 	errorWritingFileMsg     = "Error writing to file: %v"
 )
 
@@ -34,27 +35,23 @@ func getVideoId(videoUrl string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to parse URL: %w", err)
 	}
-	q := u.Query()
-	videoId := q.Get("v")
-	return videoId, nil
+	return u.Query().Get("v"), nil
 }
 
-func getComments(videoUrls []string, maxComments int64, developerKey string) {
+func getComments(ctx context.Context, videoUrls []string, maxComments int64, developerKey string) {
 	var wg sync.WaitGroup
-	limiter := rate.NewLimiter(rate.Every(1*time.Second), 1) // Adjust as needed
+	limiter := rate.NewLimiter(rate.Every(time.Second), 1)
 
 	for _, videoUrl := range videoUrls {
 		wg.Add(1)
 		go func(videoUrl string) {
 			defer wg.Done()
 
-			// Respect rate limit
-			if err := limiter.Wait(context.Background()); err != nil { // Use the context package here
+			if err := limiter.Wait(ctx); err != nil {
 				color.Red("Rate limit error: %v", err)
 				return
 			}
 
-			// Retry on network errors
 			operation := func() error {
 				client := &http.Client{
 					Transport: &transport.APIKey{Key: developerKey},
@@ -62,7 +59,7 @@ func getComments(videoUrls []string, maxComments int64, developerKey string) {
 
 				service, err := youtube.New(client)
 				if err != nil {
-					return fmt.Errorf("Error creating new YouTube client: %w", err)
+					return fmt.Errorf("error creating new YouTube client: %w", err)
 				}
 
 				videoId, err := getVideoId(videoUrl)
@@ -70,19 +67,15 @@ func getComments(videoUrls []string, maxComments int64, developerKey string) {
 					return fmt.Errorf("%s: %w", invalidURLMsg, err)
 				}
 
-				currentDir, err := os.Getwd()
-				if err != nil {
-					return fmt.Errorf("Error getting current directory: %w", err)
-				}
-
-				filename := defaultCommentsFileName + ".txt"
-				commentsFile := fmt.Sprintf("%s/%s", currentDir, filename)
-
-				file, err := os.OpenFile(commentsFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+				filename := fmt.Sprintf("%s_%s.txt", defaultCommentsFileName, videoId)
+				file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 				if err != nil {
 					return fmt.Errorf("%s: %w", errorWritingFileMsg, err)
 				}
 				defer file.Close()
+
+				writer := bufio.NewWriter(file)
+				defer writer.Flush()
 
 				call := service.CommentThreads.List([]string{"snippet"}).VideoId(videoId).MaxResults(maxComments)
 				response, err := call.Do()
@@ -92,9 +85,7 @@ func getComments(videoUrls []string, maxComments int64, developerKey string) {
 
 				for _, item := range response.Items {
 					comment := item.Snippet.TopLevelComment
-					author := comment.Snippet.AuthorDisplayName
-					text := comment.Snippet.TextDisplay
-					_, err := file.WriteString(fmt.Sprintf("Comment by %s: %s\n", author, text))
+					_, err := fmt.Fprintf(writer, "Comment from %s: %s\n", comment.Snippet.AuthorDisplayName, comment.Snippet.TextDisplay)
 					if err != nil {
 						return fmt.Errorf("%s: %w", errorWritingFileMsg, err)
 					}
@@ -103,10 +94,9 @@ func getComments(videoUrls []string, maxComments int64, developerKey string) {
 				return nil
 			}
 
-			// Use exponential backoff for retries
 			err := backoff.Retry(operation, backoff.NewExponentialBackOff())
 			if err != nil {
-				color.Red("Failed to get comments: %v", err)
+				color.Red("Failed to retrieve comments: %v", err)
 			}
 		}(videoUrl)
 	}
@@ -120,17 +110,18 @@ func getDeveloperKey() string {
 
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
-			color.Cyan("Configuration file not found. Creating one.")
+			color.Cyan("Configuration file not found. Creating.")
 			color.Cyan("Enter your developer key: ")
-			var developerKey string
-			fmt.Scanln(&developerKey)
+			developerKey := readInput()
 
 			viper.Set("developerKey", developerKey)
-			viper.WriteConfigAs("./config.yaml")
+			if err := viper.WriteConfigAs("./config.yaml"); err != nil {
+				color.Red("Error writing configuration file: %v", err)
+			}
 
 			return developerKey
 		} else {
-			color.Red("Error reading config file: %v", err)
+			color.Red("Error reading configuration file: %v", err)
 			return ""
 		}
 	}
@@ -139,53 +130,51 @@ func getDeveloperKey() string {
 }
 
 func getNumberOfComments() int {
-	var input string
-	var maxComments int
-	var err error
-
 	for {
 		color.Cyan("Enter the number of comments to retrieve: ")
-		fmt.Scanln(&input)
-		maxComments, err = strconv.Atoi(input)
+		input := readInput()
+		maxComments, err := strconv.Atoi(input)
 		if err != nil || maxComments < 0 {
 			color.Red(invalidInputMsg)
 		} else {
-			break
+			return maxComments
 		}
 	}
-
-	return maxComments
 }
 
 func askToContinue() bool {
-	var input string
-
 	for {
 		color.Cyan("Do you want to continue? (Y/N): ")
-		fmt.Scanln(&input)
-		input = strings.ToLower(input)
-		if input == "y" || input == "yes" {
+		input := strings.ToLower(readInput())
+		switch input {
+		case "y", "yes":
 			return true
-		} else if input == "n" || input == "no" {
+		case "n", "no":
 			return false
-		} else {
+		default:
 			color.Red("Invalid input. Please enter Y or N.")
 		}
 	}
 }
 
+func readInput() string {
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Scan()
+	return scanner.Text()
+}
+
 func main() {
 	developerKey := getDeveloperKey()
+	ctx := context.Background()
 
 	for {
 		maxComments := getNumberOfComments()
 
-		fmt.Println("Enter the YouTube video URL: ")
-		var videoUrl string
-		fmt.Scanln(&videoUrl)
+		color.Cyan("Enter the YouTube video URL: ")
+		videoUrl := readInput()
 		videoUrls := []string{videoUrl}
 
-		getComments(videoUrls, int64(maxComments), developerKey)
+		getComments(ctx, videoUrls, int64(maxComments), developerKey)
 
 		if !askToContinue() {
 			return
